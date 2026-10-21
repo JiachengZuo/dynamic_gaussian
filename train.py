@@ -47,16 +47,37 @@ def parse_args():
     parser.add_argument('--local_rank', type=int, default=0)
     parser.add_argument('--use_splatformer', type=bool, default=False)
     parser.add_argument('--downsample_3dgs', type=bool, default=False)
+    # --- Dynamic Gaussian Budget Allocation (NEW) ---
+    parser.add_argument('--alpha', type=float, default=1.0,
+                        help='Weight for (1-vis_sim) in utility score S_i')
+    parser.add_argument('--beta', type=float, default=1.0,
+                        help='Weight for err_map in utility score S_i')
+    parser.add_argument('--eps', type=float, default=1e-6,
+                        help='Small constant in S_i')
+    parser.add_argument('--lambda_budget', type=float, default=1.0,
+                        help='Budget penalty weight')
+    parser.add_argument('--utility_loss_weight', type=float, default=0.1,
+                        help='Weight for utility maximization loss')
+    parser.add_argument('--budget_loss_weight', type=float, default=0.1,
+                        help='Weight for budget constraint loss')
+    parser.add_argument('--vis_loss_weight', type=float, default=0.1,
+                        help='Weight for co-visibility supervision loss')
+    parser.add_argument('--err_loss_weight', type=float, default=0.1,
+                        help='Weight for error head supervision (L1 error target)')
+    parser.add_argument('--covisibility_dir', type=str, default=None,
+                        help='Directory containing covisibility_map_*.png files')
     return parser.parse_args()
 
 def main(args):
-    dist.init_process_group(backend='nccl')
     args.local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(args.local_rank)
     device = torch.device("cuda", args.local_rank)
     dtype = torch.float32
+
+    dist.init_process_group(backend='nccl')
     
-    dataset = WaymoOpenDataset(args.image_dir, scene_names=[str(i).zfill(3) for i in range(300,600)], sequence_length=args.sequence_length, mode=1, views=1)
+    dataset = WaymoOpenDataset(args.image_dir, scene_names=[str(i).zfill(3) for i in range(300,600)], sequence_length=args.sequence_length, mode=1, views=1,
+                               covisibility_dir=args.covisibility_dir)
     sampler = DistributedSampler(dataset,shuffle=True)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=4)
 
@@ -65,32 +86,45 @@ def main(args):
         os.makedirs(os.path.join(args.log_dir, "images"), exist_ok=True)
         os.makedirs(os.path.join(args.log_dir, "ckpt"), exist_ok=True)
 
-    model = VGGT().to(device)
+    model = VGGT(alpha=args.alpha, beta=args.beta, eps=args.eps,
+                  lambda_budget=args.lambda_budget).to(device)
     checkpoint = torch.load(args.ckpt_path, map_location="cpu")
     model.load_state_dict(checkpoint, strict=False)
 
     model.train()
-    model = DDP(model, device_ids=[args.local_rank]) #, find_unused_parameters=True)
+
+    # Freeze/unfreeze BEFORE DDP wrapping — DDP records trainable params at construction time
+    for param in model.parameters():
+        param.requires_grad = False
+    for head_name in ["gs_head","instance_head","sky_model",
+                      # --- Dynamic budget heads (NEW) ---
+                      "assign_head", "vis_head", "vis_proj",
+                      "err_head", "fea_head", "gs_decoders" ]:
+        for param in getattr(model, head_name).parameters():
+            param.requires_grad = True
+
+    optimizer = AdamW([
+        {'params': model.gs_head.parameters(), 'lr': 4e-5},
+        # {'params': model.semantic_head.parameters(), 'lr': 1e-4},
+        {'params': model.instance_head.parameters(), 'lr': 4e-5},
+        {'params': model.sky_model.parameters(), 'lr': 1e-4},
+        # --- Dynamic budget heads (NEW) ---
+        {'params': model.assign_head.parameters(), 'lr': 4e-5},
+        {'params': model.vis_head.parameters(), 'lr': 4e-5},
+        {'params': model.vis_proj.parameters(), 'lr': 4e-5},
+        {'params': model.err_head.parameters(), 'lr': 4e-5},
+        {'params': model.fea_head.parameters(), 'lr': 4e-5},
+        {'params': model.gs_decoders.parameters(), 'lr': 4e-5},
+    ], weight_decay=1e-4)
+
+    model = DDP(model, device_ids=[args.local_rank])
     model._set_static_graph()
-    
+
     lpips_loss_fn = lpips.LPIPS(net='alex').to(device)
 
 
     binary_loss_fn = torch.nn.BCEWithLogitsLoss(reduction='mean')
     semantic_loss_fn = torch.nn.CrossEntropyLoss(ignore_index=255)
-
-    for param in model.module.parameters():
-        param.requires_grad = False
-    for head_name in ["gs_head","instance_head","sky_model" ]: #, "gs_head","instance_head","sky_model", "semantic_head"
-        for param in getattr(model.module, head_name).parameters():
-            param.requires_grad = True
-
-    optimizer = AdamW([
-        {'params': model.module.gs_head.parameters(), 'lr': 4e-5},
-        # {'params': model.module.semantic_head.parameters(), 'lr': 1e-4},
-        {'params': model.module.instance_head.parameters(), 'lr': 4e-5},
-        {'params': model.module.sky_model.parameters(), 'lr': 1e-4},
-    ], weight_decay=1e-4)
 
     warmup_iterations = 1000
     scheduler = LambdaLR(
@@ -121,43 +155,80 @@ def main(args):
                 extrinsic = torch.cat([extrinsic, bottom], dim=1)
                 intrinsic = intrinsics[0]
 
-                use_depth = True
-                if use_depth:
-                    depth_map = predictions["depth"][0]
-                    point_map = unproject_depth_map_to_point_map(depth_map, extrinsics[0], intrinsics[0])[None,...]
-                    point_map = torch.from_numpy(point_map).to(device).float()
-                else:      
-                    point_map = predictions["world_points"]
-                gs_map = predictions["gs_map"]
-                gs_conf = predictions["gs_conf"]
-                dy_map = predictions["dynamic_conf"].squeeze(-1) #B,H,W,1
-                semantic_logits = predictions["semantic_logits"]  #road, building, car, truck, person, bicycle, sky, vegetation
+                # --- Read new DGGT dynamic budget outputs (NEW) ---
+                gs_map = predictions["gs_map"]          # [B, S, H, W, 4, 14]
+                gs_point_map = predictions["gs_point_map"]  # [B, S, H, W, 4, 3]
+                gs_active = predictions["gs_active_mask"]  # [B, S, H, W, 4] bool
+                dy_map = predictions["dynamic_conf"].squeeze(-1)  # [B, S, H, W]
 
-                static_mask = torch.ones_like(bg_mask)
-                static_points = point_map[static_mask].reshape(-1, 3)
-                gs_dynamic_list = dy_map[static_mask].sigmoid() 
-                static_rgbs, static_opacity, static_scales, static_rotations = get_split_gs(gs_map, static_mask)
-                static_opacity = static_opacity * (1 - gs_dynamic_list)
-                static_gs_conf = gs_conf[static_mask]
-                frame_idx = torch.nonzero(static_mask, as_tuple=False)[:,1]
-                gs_timestamps = timestamps[frame_idx]     
+                # --- Utility score and allocation from budget heads (NEW) ---
+                S_i = predictions.get("S_i", None)      # [B, S, 1, H, W]
+                n_i = predictions.get("n_i", None)      # [B, S, H, W, 1]
 
-                dynamic_points, dynamic_rgbs, dynamic_opacitys, dynamic_scales, dynamic_rotations = [], [], [], [], []
-                for i in range(dy_map.shape[1]):
-                    point_map_i = point_map[:, i]
-                    bg_mask_i = bg_mask[:, i]
-                    dynamic_point = point_map_i[bg_mask_i].reshape(-1, 3)
-                    dynamic_rgb, dynamic_opacity, dynamic_scale, dynamic_rotation = get_split_gs(gs_map[:, i], bg_mask_i)
-                    gs_dynamic_list_i = dy_map[:, i][bg_mask_i].sigmoid() 
-                    dynamic_opacity = dynamic_opacity * gs_dynamic_list_i
-                    dynamic_points.append(dynamic_point)
-                    dynamic_rgbs.append(dynamic_rgb)
-                    dynamic_opacitys.append(dynamic_opacity)
-                    dynamic_scales.append(dynamic_scale)
-                    dynamic_rotations.append(dynamic_rotation)
-                    
-                chunked_renders, chunked_alphas = [], []
+                semantic_logits = predictions["semantic_logits"]  # road, building, ...
+
+                # --- Extract non-sky active Gaussians as flat tensors ---
+                mask = gs_active & bg_mask.unsqueeze(-1)  # [1, S, H, W, 4]
+                b_idx, s_idx, h_idx, w_idx, k_idx = mask.nonzero(as_tuple=True)
+
+                gs_vals = gs_map[b_idx, s_idx, h_idx, w_idx, k_idx].float()  # [N, 14]
+                gs_pts  = gs_point_map[b_idx, s_idx, h_idx, w_idx, k_idx].float()  # [N, 3]
+
+                # Channel layout (from vggt.py): color(0:3) opacity(3) scale(4:7) rotation(7:11) conf(11) depth_off(12)
+                all_rgbs     = gs_vals[:, :3]
+                all_opacity  = gs_vals[:, 3]
+                all_scales   = gs_vals[:, 4:7]
+                all_rotation = gs_vals[:, 7:11]
+                all_conf     = gs_vals[:, 11]          # confidence channel
+
+                # Quaternion normalization (gsplat expects wxyz)
+                q_norm = all_rotation.norm(dim=-1, keepdim=True)
+                ident = torch.zeros_like(all_rotation)
+                ident[:, 0] = 1.0
+                all_rotation = torch.where(
+                    q_norm > 1e-8,
+                    all_rotation / q_norm.clamp_min(1e-8),
+                    ident,
+                )
+
+                # Per-element dynamic probability from the source frame
+                all_dy_prob = dy_map[b_idx, s_idx, h_idx, w_idx].sigmoid()  # [N]
+                all_timestamps = timestamps[s_idx]  # [N]
+
+                # --- Static pass: all non-sky GS with opacity weighted by (1 - dy_prob) ---
+                static_opacity = all_opacity * (1.0 - all_dy_prob)
+                static_points  = gs_pts
+                static_rgbs    = all_rgbs
+                static_scales  = all_scales
+                static_rotations = all_rotation
+                static_gs_conf = all_conf
+                gs_timestamps  = all_timestamps
+
+                # --- Dynamic pass (per frame): opacity weighted by dy_prob per frame ---
                 S = extrinsic.shape[0]
+                dynamic_points, dynamic_rgbs, dynamic_opacitys, dynamic_scales, dynamic_rotations = \
+                    [], [], [], [], []
+                for i in range(S):
+                    dyn_mask = (s_idx == i) & bg_mask[b_idx, s_idx, h_idx, w_idx]
+                    if dyn_mask.any():
+                        dyn_vals = gs_vals[dyn_mask]
+                        dyn_pts  = gs_pts[dyn_mask]
+                        dyn_dy   = all_dy_prob[dyn_mask]
+                        dynamic_points.append(dyn_pts)
+                        dynamic_rgbs.append(dyn_vals[:, :3])
+                        dynamic_opacitys.append(dyn_vals[:, 3] * dyn_dy)
+                        dynamic_scales.append(dyn_vals[:, 4:7])
+                        dynamic_rotations.append(all_rotation[dyn_mask])
+                    else:
+                        # Maintain 1:1 frame index correspondence (matching original code)
+                        dynamic_points.append(torch.zeros(0, 3, device=device))
+                        dynamic_rgbs.append(torch.zeros(0, 3, device=device))
+                        dynamic_opacitys.append(torch.zeros(0, device=device))
+                        dynamic_scales.append(torch.zeros(0, 3, device=device))
+                        dynamic_rotations.append(torch.zeros(0, 4, device=device))
+
+                chunked_renders, chunked_alphas = [], []
+                
                 for idx in range(S):
                     t0 = timestamps[idx]
                     static_opacity_ = alpha_t(gs_timestamps, t0, static_opacity, gamma0 = static_gs_conf)
@@ -185,7 +256,7 @@ def main(args):
                 renders = torch.cat(chunked_renders, dim=0)
                 alphas = torch.cat(chunked_alphas, dim=0)
                 bg_render = model.module.sky_model(images, extrinsic, intrinsic)
-                renders = alphas * renders + (1 - alphas) * bg_render
+                renders = renders + (1 - alphas) * bg_render
 
                 rendered_image = renders.permute(0, 3, 1, 2)
                 target_image = images[0]
@@ -199,8 +270,11 @@ def main(args):
                 sky_mask_loss = F.l1_loss(alphas, 1 - sky_mask[0, ..., 0][..., None])
                 loss +=  sky_mask_loss
 
-                gs_conf_loss = compute_lifespan_loss(static_gs_conf)
-                loss += 0.01 * gs_conf_loss
+                if static_gs_conf.numel() > 0:
+                    gs_conf_loss = compute_lifespan_loss(static_gs_conf)
+                    loss += 0.01 * gs_conf_loss
+                else:
+                    gs_conf_loss = torch.tensor(0.0, device=device)
                 
                 #dynamic mask loss
                 if 'dynamic_mask' in batch:
@@ -222,13 +296,81 @@ def main(args):
                     lpips_val = lpips_loss_fn(rendered_image, target_image)
                     loss += 0.05 * min(step / 1000, 1.0) * lpips_val.mean() # *
 
+                # ========================================================
+                # Dynamic Gaussian Budget Allocation Losses (NEW)
+                # ========================================================
+                if S_i is not None and n_i is not None:
+                    demand   = S_i.squeeze(2).float()    # [B, S, H, W]
+                    alloc    = n_i.squeeze(-1).float()   # [B, S, H, W]
+                    non_sky  = bg_mask.float()
+
+                    # Utility: encourage higher allocation where demand is high
+                    utility = -(
+                        demand.detach().clamp_min(0)
+                        * torch.log1p(alloc.clamp_min(0))
+                        * non_sky
+                    ).sum() / non_sky.sum().clamp_min(1)
+
+                    # Budget: penalize deviation from target G = H * W
+                    budget_target = H * W  # avg 1 Gaussian per pixel across frames
+                    continuous_total = (alloc * non_sky).sum()
+                    budget_loss_val = (
+                        (continuous_total - budget_target) / max(budget_target, 1)
+                    ).square()
+
+                    loss += args.utility_loss_weight * utility
+                    loss += args.budget_loss_weight * budget_loss_val
+
+                # --- Co-visibility supervision (NEW) ---
+                vis_loss = None
+                if "vis_sim" in predictions and "covisibility" in batch:
+                    vis_pred = predictions["vis_sim"].squeeze(2).float()  # [B, S, H, W]
+                    vis_gt   = batch["covisibility"].to(device).float()
+                    if vis_gt.ndim == 3 and vis_gt.shape[0] == 1:
+                        vis_gt = vis_gt.unsqueeze(0)
+                    valid = torch.isfinite(vis_gt) & (vis_gt >= 0) & (vis_gt <= 1)
+                    if valid.any():
+                        vis_loss = F.mse_loss(vis_pred[valid], vis_gt[valid])
+                        loss += args.vis_loss_weight * vis_loss
+
+                # --- Error Head supervision (NEW): predict actual L1 rendering error ---
+                #   Connects L1 → err_head → err_map → S_i → assign_head
+                #   err_head learns to predict where rendering is difficult,
+                #   making S_i a meaningful allocation guide.
+                error_loss = None
+                if args.err_loss_weight > 0 and "err_map" in predictions:
+                    err_map = predictions["err_map"].squeeze(-1).float()  # [1, S, H, W]
+                    error_target = (
+                        rendered_image.detach() - target_image
+                    ).abs().mean(dim=1)  # [S, H, W]
+                    if err_map.shape[1:] == error_target.shape:
+                        non_sky_err = bg_mask[0]
+                        if non_sky_err.any():
+                            error_loss = F.smooth_l1_loss(
+                                err_map[0][non_sky_err],
+                                error_target[non_sky_err],
+                            )
+                            loss += args.err_loss_weight * error_loss
+
             loss.backward()
             optimizer.step()
             scheduler.step()
 
         if args.local_rank == 0 and step % 1 == 0:
             print(f"[{step}/{args.max_epoch}] Loss: {loss.item():.4f} | LR: {scheduler.get_last_lr()}")
-            print(f"[{step}/{args.max_epoch}]   sky Loss: {sky_mask_loss.item():.4f} | LR: {scheduler.get_last_lr()}")
+            print(f"[{step}/{args.max_epoch}]   sky Loss: {sky_mask_loss.item():.4f}")
+            if S_i is not None and n_i is not None:
+                with torch.no_grad():
+                    avg_n = alloc.mean().item()
+                    total_n = alloc.sum().item()
+                print(f"[{step}/{args.max_epoch}]   utility: {utility.item():.4f} "
+                      f"| budget: {budget_loss_val.item():.4f}")
+                print(f"[{step}/{args.max_epoch}]   avg_n_i: {avg_n:.3f} "
+                      f"| total_n: {total_n:.1f} | G: {budget_target}")
+            if vis_loss is not None:
+                print(f"[{step}/{args.max_epoch}]   vis Loss: {vis_loss.item():.4f}")
+            if error_loss is not None:
+                print(f"[{step}/{args.max_epoch}]   err Loss: {error_loss.item():.4f}")
 
         if args.local_rank == 0 and step % args.save_image == 0:
             random_frame_idx = random.randint(0, rendered_image.shape[0] - 1)

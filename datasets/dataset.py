@@ -136,8 +136,34 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
     return images
 
 
+def load_covisibility_map(covisibility_path, target_h=37, target_w=37, image_h=518, image_w=518):
+    """
+    Load covisibility map and downsample to patch resolution.
+
+    Args:
+        covisibility_path: path to covisibility map PNG
+        target_h, target_w: patch grid resolution (default 37)
+        image_h, image_w: image resolution (default 518)
+    Returns:
+        torch.FloatTensor [1, target_h, target_w] normalized to [0, 1]
+        or None if file not found
+    """
+    if not covisibility_path or not os.path.isfile(covisibility_path):
+        return None
+    img = Image.open(covisibility_path).convert('L')
+    # Resize to match image resolution first
+    img = img.resize((image_w, image_h), Image.Resampling.BICUBIC)
+    arr = np.array(img, dtype=np.float32) / 255.0  # normalize to [0, 1]
+    tensor = torch.from_numpy(arr)  # [image_h, image_w]
+    # Downsample to patch resolution by averaging
+    tensor = tensor.view(target_h, image_h // target_h, target_w, image_w // target_w)
+    tensor = tensor.mean(dim=(1, 3))  # [target_h, target_w]
+    tensor = tensor.unsqueeze(0)  # [1, target_h, target_w]
+    return tensor
+
+
 class WaymoOpenDataset(Dataset):
-    def __init__(self, image_dir, scene_names = None, sequence_length= None, start_idx = -1, mode=1, views=1, intervals=2):
+    def __init__(self, image_dir, scene_names = None, sequence_length= None, start_idx = -1, mode=1, views=1, intervals=2, covisibility_dir=None):
         #mode 1 : train
         #mode 2 : pure reconstruction
         #mode 3 : interplation
@@ -185,6 +211,7 @@ class WaymoOpenDataset(Dataset):
         self.ego_paths = []
 
         self.start_idx = start_idx
+        self.covisibility_dir = covisibility_dir  # directory containing covisibility_map_*.png
 
         for scene_name in scene_names:
             scene_path = os.path.join(image_dir, scene_name, "images")
@@ -384,7 +411,17 @@ class WaymoOpenDataset(Dataset):
                     dynamic_mask = load_and_preprocess_images(dy_mask_seq)  # [S*3, C, H, W]
                 input_dict["dynamic_mask"] = dynamic_mask
 
-            
+            # Covisibility map (ground truth for vis branch)
+            if self.covisibility_dir is not None:
+                scene_name = self.scenes[idx]
+                covis_path = os.path.join(
+                    self.covisibility_dir, f"covisibility_map_{scene_name}.png"
+                )
+                covis_map = load_covisibility_map(covis_path)
+                if covis_map is not None:
+                    input_dict["covisibility"] = covis_map
+
+
             # if len(semantic_mask_paths) > 0:
             #     if self.views == 1:
             #         sem_mask_seq = [semantic_mask_paths[i] for i in indices]
