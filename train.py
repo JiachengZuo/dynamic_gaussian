@@ -69,6 +69,12 @@ def parse_args():
                              'maps are matched to image basenames')
     parser.add_argument('--covisibility_sequence_length', type=int, default=4,
                         help='Window length used to generate visibility-count maps')
+    parser.add_argument('--ste_gate_temperature', type=float, default=0.5,
+                        help='Temperature for the straight-through Gaussian gates')
+    parser.add_argument('--disable_ste', action='store_true',
+                        help='Disable STE gates during training')
+    parser.add_argument('--ste_grad_check', action='store_true',
+                        help='Check whether rendering loss reaches the allocation head')
     return parser.parse_args()
 
 def main(args):
@@ -92,7 +98,9 @@ def main(args):
         os.makedirs(os.path.join(args.log_dir, "ckpt"), exist_ok=True)
 
     model = VGGT(alpha=args.alpha, beta=args.beta, eps=args.eps,
-                  lambda_budget=args.lambda_budget).to(device)
+                  lambda_budget=args.lambda_budget,
+                  ste_gate_temperature=args.ste_gate_temperature,
+                  ste_enabled=not args.disable_ste).to(device)
     checkpoint = torch.load(args.ckpt_path, map_location="cpu")
     model.load_state_dict(checkpoint, strict=False)
 
@@ -138,8 +146,9 @@ def main(args):
             1 + torch.cos(torch.tensor(torch.pi * step / args.max_epoch)))
     )
 
+    ste_grad_check_done = False
     for step in tqdm(range(args.max_epoch)):
-        sampler.set_epoch(step)        
+        sampler.set_epoch(step)
         for batch in dataloader:
             images = batch['images'].to(device)
             sky_mask = batch['masks'].to(device).permute(0, 1, 3, 4, 2)
@@ -163,7 +172,8 @@ def main(args):
                 # --- Read new DGGT dynamic budget outputs (NEW) ---
                 gs_map = predictions["gs_map"]          # [B, S, H, W, 4, 14]
                 gs_point_map = predictions["gs_point_map"]  # [B, S, H, W, 4, 3]
-                gs_active = predictions["gs_active_mask"]  # [B, S, H, W, 4] bool
+                gs_active = predictions["gs_active_mask"]  # [B, S, H, W, 4] hard active mask
+                gs_render = predictions.get("gs_render_mask", gs_active)
                 dy_map = predictions["dynamic_conf"].squeeze(-1)  # [B, S, H, W]
 
                 # --- Utility score and allocation from budget heads (NEW) ---
@@ -172,16 +182,22 @@ def main(args):
 
                 semantic_logits = predictions["semantic_logits"]  # road, building, ...
 
-                # --- Extract non-sky active Gaussians as flat tensors ---
-                mask = gs_active & bg_mask.unsqueeze(-1)  # [1, S, H, W, 4]
+                # In STE mode this also includes the boundary candidate; its
+                # hard forward opacity is zero but its surrogate gradient is retained.
+                mask = gs_render & bg_mask.unsqueeze(-1)
                 b_idx, s_idx, h_idx, w_idx, k_idx = mask.nonzero(as_tuple=True)
 
                 gs_vals = gs_map[b_idx, s_idx, h_idx, w_idx, k_idx].float()  # [N, 14]
                 gs_pts  = gs_point_map[b_idx, s_idx, h_idx, w_idx, k_idx].float()  # [N, 3]
+                ste_gate = predictions.get("gs_ste_gate")
+                all_opacity = gs_vals[:, 3]
+                if ste_gate is not None:
+                    all_opacity = all_opacity * ste_gate[
+                        b_idx, s_idx, h_idx, w_idx, k_idx
+                    ].float()
 
                 # Channel layout (from vggt.py): color(0:3) opacity(3) scale(4:7) rotation(7:11) conf(11) depth_off(12)
                 all_rgbs     = gs_vals[:, :3]
-                all_opacity  = gs_vals[:, 3]
                 all_scales   = gs_vals[:, 4:7]
                 all_rotation = gs_vals[:, 7:11]
                 all_conf     = gs_vals[:, 11]          # confidence channel
@@ -221,7 +237,7 @@ def main(args):
                         dyn_dy   = all_dy_prob[dyn_mask]
                         dynamic_points.append(dyn_pts)
                         dynamic_rgbs.append(dyn_vals[:, :3])
-                        dynamic_opacitys.append(dyn_vals[:, 3] * dyn_dy)
+                        dynamic_opacitys.append(all_opacity[dyn_mask] * dyn_dy)
                         dynamic_scales.append(dyn_vals[:, 4:7])
                         dynamic_rotations.append(all_rotation[dyn_mask])
                     else:
@@ -270,7 +286,8 @@ def main(args):
                 ####################### Loss ###########################
 
 
-                loss = F.l1_loss(rendered_image, target_image)
+                render_loss = F.l1_loss(rendered_image, target_image)
+                loss = render_loss
 
                 sky_mask_loss = F.l1_loss(alphas, 1 - sky_mask[0, ..., 0][..., None])
                 loss +=  sky_mask_loss
@@ -361,8 +378,34 @@ def main(args):
                                 error_target[non_sky_err],
                             )
                             loss += args.err_loss_weight * error_loss
-                import pdb; pdb.set_trace()
+                
+            check_ste_grad = args.ste_grad_check and not ste_grad_check_done
+            if check_ste_grad:
+                if predictions.get("gs_ste_gate") is None:
+                    raise RuntimeError("STE gradient check requested but STE is disabled")
+                allocation_grad = torch.autograd.grad(
+                    render_loss,
+                    predictions["n_i"],
+                    retain_graph=True,
+                    allow_unused=True,
+                )[0]
+                if allocation_grad is None:
+                    raise RuntimeError("Render L1 has no gradient path to n_i")
+                grad_norm = allocation_grad.float().norm().item()
+                print(f"[STE check] ||dL1/dn_i||={grad_norm:.6e}")
+                if not torch.isfinite(allocation_grad).all() or grad_norm == 0:
+                    raise RuntimeError("Render L1 gradient to n_i is zero or non-finite")
+
             loss.backward()
+            if check_ste_grad:
+                assign_grad = model.module.assign_head.conv_out.bias.grad
+                if assign_grad is None or not torch.isfinite(assign_grad).all():
+                    raise RuntimeError("STE produced no finite AssignHead output-bias gradient")
+                assign_grad_norm = assign_grad.float().norm().item()
+                print(f"[STE check] ||dL/dAssignHead.bias||={assign_grad_norm:.6e}")
+                if assign_grad_norm == 0:
+                    raise RuntimeError("AssignHead output-bias gradient is zero")
+                ste_grad_check_done = True
             optimizer.step()
             scheduler.step()
 
@@ -372,11 +415,13 @@ def main(args):
             if S_i is not None and n_i is not None:
                 with torch.no_grad():
                     avg_n = alloc.mean().item()
-                    total_n = alloc.sum().item()
+                    total_n = (alloc * non_sky).sum().item()
+                    hard_total = (gs_active & bg_mask.unsqueeze(-1)).sum().item()
                 print(f"[{step}/{args.max_epoch}]   utility: {utility.item():.4f} "
                       f"| budget: {budget_loss_val.item():.4f}")
                 print(f"[{step}/{args.max_epoch}]   avg_n_i: {avg_n:.3f} "
-                      f"| total_n: {total_n:.1f} | G: {budget_target}")
+                      f"| continuous_non_sky: {total_n:.1f} "
+                      f"| hard_active: {hard_total:.1f} | G: {budget_target}")
             if vis_loss is not None:
                 print(f"[{step}/{args.max_epoch}]   vis Loss: {vis_loss.item():.4f}")
             if error_loss is not None:

@@ -20,7 +20,8 @@ from dggt.models.sky import SkyGaussian
 class VGGT(nn.Module, PyTorchModelHubMixin):
     def __init__(self, img_size=518, patch_size=14, embed_dim=1024, semantic_num=10,
                  alpha=1.0, beta=1.0, eps=1e-6, lambda_budget=1.0,
-                 depth_offset_range=0.25):
+                 depth_offset_range=0.25, ste_gate_temperature=0.5,
+                 ste_enabled=False):
         super().__init__()
 
         self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
@@ -47,6 +48,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.eps = eps                      # small constant to keep S_i > 0
         self.lambda_budget = lambda_budget  # budget penalty weight
         self.num_gaussian_levels = 4        # 4 candidate Gaussian configs
+        self.ste_gate_temperature = float(ste_gate_temperature)
+        if self.ste_gate_temperature <= 0:
+            raise ValueError("ste_gate_temperature must be positive")
+        self.ste_enabled = bool(ste_enabled)
         self.patch_size = patch_size
         self.depth_offset_range = depth_offset_range  # r in d_k = d_0*(1+r*tanh(a_k))
 
@@ -393,37 +398,46 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 depth_offsets.append(depth_off)  # [B, S, H, W, 1]
             
             # ---- 7. Round n_i to integer, build active mask ----
-            # torch.Size([1, 4, 294, 518])
             n_i_int = n_i.squeeze(-1).round().long().clamp(
                 0, self.num_gaussian_levels
             )  # [B, S, H, W]  values in {0,1,2,3,4}
 
-            # active_mask[b,s,k,h,w] = True iff k < n_i_int[b,s,h,w]
             level_idx = torch.arange(
                 self.num_gaussian_levels, device=n_i_int.device
             ).view(1, 1, -1, 1, 1)
             active_mask = level_idx < n_i_int.unsqueeze(2)
-            # [B, S, 4, H, W] bool
-
-            # torch.Size([1, 4, 294, 518, 4])
             active_mask_hw = active_mask.permute(0, 1, 3, 4, 2)
-            # [B, S, H, W, 4] bool
 
-            # ---- 8. Stack per-level gaussians ----
             gs_map = torch.stack(gs_configs, dim=4)
-            # [B, S, H, W, 4, 14]
-
-            # ---- 9. Compute per-config 3D world points ----
-            base_depth = predictions["depth"]  # [B, S, H, W, 1]
-            pose_enc = predictions["pose_enc"]  # [B, S, 9]
-
+            base_depth = predictions["depth"]
+            pose_enc = predictions["pose_enc"]
             gs_point_map = self._compute_per_config_points(
                 base_depth, depth_offsets, pose_enc, B, S, H, W
-            )  # [B, S, H, W, 4, 3]
+            )
 
-            # ---- 10. Zero out inactive configs ----
-            gs_map = gs_map * active_mask_hw.unsqueeze(-1).float()
-            gs_point_map = gs_point_map * active_mask_hw.unsqueeze(-1).float()
+            ste_gate = None
+            ste_enabled = self.training and self.ste_enabled
+            if ste_enabled:
+                level_values = level_idx.to(dtype=n_i.dtype)
+                thresholds = level_values + 0.5
+                soft_gate = torch.sigmoid(
+                    (n_i.squeeze(-1).unsqueeze(2) - thresholds)
+                    / self.ste_gate_temperature
+                )
+                hard_gate = active_mask.to(dtype=soft_gate.dtype)
+                ste_gate = hard_gate - soft_gate.detach() + soft_gate
+
+                # Include only the first currently inactive level in rendering;
+                # its hard-forward opacity is zero but it carries STE gradients.
+                render_mask = (level_idx <= n_i_int.unsqueeze(2)).permute(
+                    0, 1, 3, 4, 2
+                )
+            else:
+                gs_map = gs_map * active_mask_hw.unsqueeze(-1).to(gs_map.dtype)
+                gs_point_map = gs_point_map * active_mask_hw.unsqueeze(-1).to(
+                    gs_point_map.dtype
+                )
+                render_mask = active_mask_hw
 
             # ---- Store dynamic-budget predictions ----
             predictions["S_i"]             = S_i              # [B,S,1,H,W]
@@ -432,6 +446,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             predictions["vis_sim"]         = vis_sim          # [B,S,1,H,W] (pixel-level)
             predictions["gs_map"]          = gs_map           # [B,S,H,W,4,14]
             predictions["gs_active_mask"]  = active_mask_hw   # [B,S,H,W,4]
+            predictions["gs_render_mask"]  = render_mask      # [B,S,H,W,4], includes STE boundary candidate in training
+            predictions["gs_ste_gate"]     = ste_gate         # [B,S,H,W,4] or None
             predictions["gs_point_map"]    = gs_point_map     # [B,S,H,W,4,3]
             predictions["err_map"]          = err_map           # [B,S,H,W,1]  for error loss supervision
 
