@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument('--image_dir', type=str, default="")
     parser.add_argument('--ckpt_path', type=str, default='')
     parser.add_argument('--log_dir', type=str, default='logs/xxx')
-    parser.add_argument('--sequence_length', type=int, default=4)#8,4
+    parser.add_argument('--sequence_length', type=int, default=3)  # S frames
     parser.add_argument('--chunk_size', type=int, default=4)
     parser.add_argument('--max_epoch', type=int, default=50000)
     parser.add_argument('--save_image', type=int, default=100)
@@ -65,10 +65,14 @@ def parse_args():
     parser.add_argument('--err_loss_weight', type=float, default=0.1,
                         help='Weight for error head supervision (L1 error target)')
     parser.add_argument('--covisibility_dir', type=str, default=None,
-                        help='Directory containing covisibility_map_*.png files')
+                        help='Optional root containing <scene>/visibility_counts maps; '
+                             'maps are matched to image basenames')
+    parser.add_argument('--covisibility_sequence_length', type=int, default=4,
+                        help='Window length used to generate visibility-count maps')
     return parser.parse_args()
 
 def main(args):
+    
     args.local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(args.local_rank)
     device = torch.device("cuda", args.local_rank)
@@ -76,8 +80,9 @@ def main(args):
 
     dist.init_process_group(backend='nccl')
     
-    dataset = WaymoOpenDataset(args.image_dir, scene_names=[str(i).zfill(3) for i in range(300,600)], sequence_length=args.sequence_length, mode=1, views=1,
-                               covisibility_dir=args.covisibility_dir)
+    dataset = WaymoOpenDataset(args.image_dir, scene_names=[str(i).zfill(3) for i in range(3,10)], sequence_length=args.sequence_length, mode=1, views=1,
+                               covisibility_dir=args.covisibility_dir,
+                               covisibility_sequence_length=args.covisibility_sequence_length)
     sampler = DistributedSampler(dataset,shuffle=True)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=4)
 
@@ -92,7 +97,7 @@ def main(args):
     model.load_state_dict(checkpoint, strict=False)
 
     model.train()
-
+    
     # Freeze/unfreeze BEFORE DDP wrapping — DDP records trainable params at construction time
     for param in model.parameters():
         param.requires_grad = False
@@ -312,7 +317,7 @@ def main(args):
                     ).sum() / non_sky.sum().clamp_min(1)
 
                     # Budget: penalize deviation from target G = H * W
-                    budget_target = H * W  # avg 1 Gaussian per pixel across frames
+                    budget_target = non_sky.sum() # avg 1 Gaussian per pixel across frames
                     continuous_total = (alloc * non_sky).sum()
                     budget_loss_val = (
                         (continuous_total - budget_target) / max(budget_target, 1)
@@ -324,10 +329,15 @@ def main(args):
                 # --- Co-visibility supervision (NEW) ---
                 vis_loss = None
                 if "vis_sim" in predictions and "covisibility" in batch:
-                    vis_pred = predictions["vis_sim"].squeeze(2).float()  # [B, S, H, W]
-                    vis_gt   = batch["covisibility"].to(device).float()
-                    if vis_gt.ndim == 3 and vis_gt.shape[0] == 1:
-                        vis_gt = vis_gt.unsqueeze(0)
+                    vis_pred = predictions["vis_sim"].float()  # [B, S, 1, H, W]
+                    vis_gt = batch["covisibility"].to(device).float()
+                    if vis_gt.ndim == 4:
+                        vis_gt = vis_gt.unsqueeze(2)
+                    if vis_gt.ndim != 5 or vis_gt.shape != vis_pred.shape:
+                        raise ValueError(
+                            f"Covisibility shape mismatch: prediction {vis_pred.shape}, "
+                            f"target {vis_gt.shape}"
+                        )
                     valid = torch.isfinite(vis_gt) & (vis_gt >= 0) & (vis_gt <= 1)
                     if valid.any():
                         vis_loss = F.mse_loss(vis_pred[valid], vis_gt[valid])
@@ -351,7 +361,7 @@ def main(args):
                                 error_target[non_sky_err],
                             )
                             loss += args.err_loss_weight * error_loss
-
+                import pdb; pdb.set_trace()
             loss.backward()
             optimizer.step()
             scheduler.step()

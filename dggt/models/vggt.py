@@ -93,6 +93,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         fused_dim = 256 + 1 + 1
         self.assign_head = AssignHead(in_channels=fused_dim)
 
+        # Initialize n_i bias so n_i ≈ 1 at start (not sigmoid(0)*4 ≈ 2)
+        # n_i = 4 * sigmoid(x), target sigmoid(x)=0.25 → x = log(1/3) ≈ -1.099
+        self.assign_head.conv_out.bias.data[1] = -1.099
+
         # ------------------------------------------------------------------
         # 4 Gaussian config branches: each uses DIFFERENT ViT layer
         # indices from aggregated_tokens_list.
@@ -439,7 +443,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                     dino_token_list, images, patch_start_idx
                 )
                 predictions["dynamic_conf"] = dynamic_conf
-
+            
             if self.semantic_head is not None:
                 semantic_logits, _ = self.semantic_head(
                     dino_token_list, images, patch_start_idx

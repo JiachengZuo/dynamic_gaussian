@@ -136,34 +136,58 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
     return images
 
 
-def load_covisibility_map(covisibility_path, target_h=37, target_w=37, image_h=518, image_w=518):
-    """
-    Load covisibility map and downsample to patch resolution.
-
-    Args:
-        covisibility_path: path to covisibility map PNG
-        target_h, target_w: patch grid resolution (default 37)
-        image_h, image_w: image resolution (default 518)
-    Returns:
-        torch.FloatTensor [1, target_h, target_w] normalized to [0, 1]
-        or None if file not found
-    """
+def load_covisibility_map(covisibility_path, image_h, image_w, sequence_length):
+    """Load and normalize one visibility-count map to [1, image_h, image_w]."""
     if not covisibility_path or not os.path.isfile(covisibility_path):
         return None
-    img = Image.open(covisibility_path).convert('L')
-    # Resize to match image resolution first
-    img = img.resize((image_w, image_h), Image.Resampling.BICUBIC)
-    arr = np.array(img, dtype=np.float32) / 255.0  # normalize to [0, 1]
-    tensor = torch.from_numpy(arr)  # [image_h, image_w]
-    # Downsample to patch resolution by averaging
-    tensor = tensor.view(target_h, image_h // target_h, target_w, image_w // target_w)
-    tensor = tensor.mean(dim=(1, 3))  # [target_h, target_w]
-    tensor = tensor.unsqueeze(0)  # [1, target_h, target_w]
-    return tensor
+
+    if covisibility_path.lower().endswith(".npy"):
+        arr = np.asarray(np.load(covisibility_path), dtype=np.float32)
+        if arr.ndim != 2:
+            raise ValueError(
+                f"Expected a 2D visibility map, got shape {arr.shape}: "
+                f"{covisibility_path}"
+            )
+        tensor = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
+        tensor = F.interpolate(
+            tensor, size=(image_h, image_w), mode="bilinear", align_corners=False
+        ).squeeze(0).squeeze(0)
+        # The generator stores the number of visible frames (0..S).
+        tensor = (tensor / max(sequence_length, 1)).clamp(0.0, 1.0)
+    else:
+        img = Image.open(covisibility_path).convert("L")
+        img = img.resize((image_w, image_h), Image.Resampling.BICUBIC)
+        tensor = torch.from_numpy(
+            np.array(img, dtype=np.float32) / 255.0
+        )
+
+    return tensor.unsqueeze(0)  # [1, image_h, image_w]
+
+
+def find_covisibility_map(map_dir, image_path):
+    """Match a visibility map to an image by filename stem."""
+    if not os.path.isdir(map_dir):
+        return None
+    stem = os.path.splitext(os.path.basename(image_path))[0]
+    candidates = (
+        stem + ".npy",
+        stem + ".png",
+        stem + ".jpg",
+        stem + ".jpeg",
+        "covisibility_" + stem + ".npy",
+        "covisibility_" + stem + ".png",
+        "covisibility_" + stem + ".jpg",
+        "covisibility_" + stem + ".jpeg",
+    )
+    for name in candidates:
+        path = os.path.join(map_dir, name)
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 class WaymoOpenDataset(Dataset):
-    def __init__(self, image_dir, scene_names = None, sequence_length= None, start_idx = -1, mode=1, views=1, intervals=2, covisibility_dir=None):
+    def __init__(self, image_dir, scene_names = None, sequence_length= None, start_idx = -1, mode=1, views=1, intervals=2, covisibility_dir=None, covisibility_sequence_length=None):
         #mode 1 : train
         #mode 2 : pure reconstruction
         #mode 3 : interplation
@@ -211,7 +235,12 @@ class WaymoOpenDataset(Dataset):
         self.ego_paths = []
 
         self.start_idx = start_idx
-        self.covisibility_dir = covisibility_dir  # directory containing covisibility_map_*.png
+        # If omitted, visibility maps are read from each scene's
+        # ``visibility_counts`` directory under image_dir.
+        self.covisibility_dir = covisibility_dir
+        self.covisibility_sequence_length = (
+            covisibility_sequence_length or sequence_length or 1
+        )
 
         for scene_name in scene_names:
             scene_path = os.path.join(image_dir, scene_name, "images")
@@ -411,15 +440,35 @@ class WaymoOpenDataset(Dataset):
                     dynamic_mask = load_and_preprocess_images(dy_mask_seq)  # [S*3, C, H, W]
                 input_dict["dynamic_mask"] = dynamic_mask
 
-            # Covisibility map (ground truth for vis branch)
+            # Covisibility maps are paired with the selected image files.
+            # Prefer an explicit root, otherwise use the per-scene directory.
             if self.covisibility_dir is not None:
-                scene_name = self.scenes[idx]
-                covis_path = os.path.join(
-                    self.covisibility_dir, f"covisibility_map_{scene_name}.png"
+                visibility_dir = os.path.join(
+                    self.covisibility_dir, self.scenes[idx], "visibility_counts"
                 )
-                covis_map = load_covisibility_map(covis_path)
-                if covis_map is not None:
-                    input_dict["covisibility"] = covis_map
+            else:
+                visibility_dir = os.path.join(
+                    self.image_dir, self.scenes[idx], "visibility_counts"
+                )
+
+            if os.path.isdir(visibility_dir):
+                covis_seq = [find_covisibility_map(visibility_dir, path) for path in seq]
+                missing = [
+                    path for path, covis_path in zip(seq, covis_seq)
+                    if covis_path is None
+                ]
+                if missing:
+                    raise FileNotFoundError(
+                        f"Missing covisibility map for scene {self.scenes[idx]}: {missing[0]}"
+                    )
+                covisibility = torch.stack([
+                    load_covisibility_map(
+                        path, images.shape[2], images.shape[3],
+                        self.covisibility_sequence_length
+                    )
+                    for path in covis_seq
+                ])
+                input_dict["covisibility"] = covisibility
 
 
             # if len(semantic_mask_paths) > 0:
