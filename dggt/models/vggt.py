@@ -100,15 +100,16 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
         # Initialize n_i bias so n_i ≈ 1 at start (not sigmoid(0)*4 ≈ 2)
         # n_i = 4 * sigmoid(x), target sigmoid(x)=0.25 → x = log(1/3) ≈ -1.099
-        self.assign_head.conv_out.bias.data[1] = -1.099
+        with torch.no_grad():
+            self.assign_head.conv_out.weight[1].zero_()
+            self.assign_head.conv_out.bias[1] = -1.0986123
 
         # ------------------------------------------------------------------
-        # 4 Gaussian config branches: each uses DIFFERENT ViT layer
-        # indices from aggregated_tokens_list.
-        #   Config 1: [4, 11, 17, 23]  (original DPT indices)
-        #   Config 2: [5, 12, 18, 23]  (shifted +1, cap at 23)
-        #   Config 3: [6, 13, 19, 23]  (shifted +2, cap at 23)
-        #   Config 4: [7, 14, 20, 23]  (shifted +3, cap at 23)
+        # The first Gaussian config comes from the pretrained legacy gs_head.
+        # These three branches predict only the additional configs.
+        #   Extra config 1: [5, 12, 18, 23]
+        #   Extra config 2: [6, 13, 19, 23]
+        #   Extra config 3: [7, 14, 20, 23]
         #
         # Each outputs 13 raw channels via DPTHead (output_dim=13):
         #   color(3)+opacity(1)+scale(3)+rotation(4)+depth_offset(1)+conf(1)
@@ -117,13 +118,12 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         # We manually activate the other 12 channels in forward.
         # Final gs_map channel layout (14 ch):
         #   [color(3), opacity(1), scale(3), rotation(4),
-        #    depth_offset(1), conf(1), padding(1)]
+        #    confidence(1), depth_offset(1), padding(1)]
         # ------------------------------------------------------------------
         gs_config_indices = [
-            [4, 11, 17, 23],   # Config 1 (default)
-            [5, 12, 18, 23],   # Config 2
-            [6, 13, 19, 23],   # Config 3
-            [7, 14, 20, 23],   # Config 4
+            [5, 12, 18, 23],
+            [6, 13, 19, 23],
+            [7, 14, 20, 23],
         ]
         self.gs_config_indices = gs_config_indices
         self.gs_decoders = nn.ModuleList([
@@ -133,8 +133,14 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 intermediate_layer_idx=gs_config_indices[k],
                 down_ratio=1
             )
-            for k in range(self.num_gaussian_levels)
+            for k in range(self.num_gaussian_levels - 1)
         ])
+
+        # Extra candidates should not disturb the pretrained reconstruction
+        # when they first become active. sigmoid(-4.595) is approximately 0.01.
+        with torch.no_grad():
+            for decoder in self.gs_decoders:
+                decoder.scratch.output_conv2[2].bias[3] = -4.595
 
     # -----------------------------------------------------------------
     # Helper: reshape B×S ↔ B*S for Conv2d operations
@@ -275,6 +281,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self,
         images: torch.Tensor,
         query_points: torch.Tensor = None,
+        render_sky: bool = False,
     ):
         # If without batch dimension, add it
         if len(images.shape) == 4:
@@ -286,7 +293,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         # length 24
         # aggregated_tokens_list each feature shape: torch.Size([1, 4, 782, 2048])
         # image_feature shape: torch.Size([1, 4, 21, 37, 1024])
-        aggregated_tokens_list, _, dino_token_list, \
+        aggregated_tokens_list, image_tokens_list, dino_token_list, \
             image_feature, patch_start_idx = self.aggregator(images)
 
         predictions = {}
@@ -362,13 +369,27 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             # torch.Size([1, 4, 294, 518, 1])
             n_i = n_i_bs.reshape(B, S, H, W, 1)         # [B, S, H, W, 1]
 
-            # ---- 6. 4 Gaussian config branches ----
-            #   Each DPTHead outputs (preds [B,S,H,W,12], conf [B,S,H,W])
+            # ---- 6. Pretrained base Gaussian + 3 additional configs ----
+            # Keep config 0 identical to the original DGGT Gaussian head so
+            # n_i=1 starts from the pretrained reconstruction rather than a
+            # randomly initialized decoder.
+            base_gs, base_conf = self.gs_head(
+                image_tokens_list, images, patch_start_idx
+            )
+            base_depth_offset = torch.zeros_like(base_conf).unsqueeze(-1)
+            base_padding = torch.zeros_like(base_depth_offset)
+            base_config = torch.cat(
+                [base_gs, base_conf.unsqueeze(-1),
+                 base_depth_offset, base_padding], dim=-1
+            )
+
+            # Each additional DPTHead outputs
+            # (preds [B,S,H,W,12], conf [B,S,H,W]).
             #   preds channels: color(0:3), opacity(3:4), scale(4:7),
             #                   rotation(7:11), depth_offset(11:12)
             #   conf is already sigmoid-ed by the DPTHead.
-            gs_configs = []       # each [B, S, H, W, 14]
-            depth_offsets = []    # each [B, S, H, W, 1]
+            gs_configs = [base_config]          # each: [B, S, H, W, 14]
+            depth_offsets = [base_depth_offset] # each: [B, S, H, W, 1]
 
             for decoder in self.gs_decoders:
                 preds, conf = decoder(
@@ -398,6 +419,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 depth_offsets.append(depth_off)  # [B, S, H, W, 1]
             
             # ---- 7. Round n_i to integer, build active mask ----
+            # Zero is a valid allocation: low-utility pixels can be removed,
+            # while the global budget encourages other pixels to receive more.
             n_i_int = n_i.squeeze(-1).round().long().clamp(
                 0, self.num_gaussian_levels
             )  # [B, S, H, W]  values in {0,1,2,3,4}
@@ -425,7 +448,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                     / self.ste_gate_temperature
                 )
                 hard_gate = active_mask.to(dtype=soft_gate.dtype)
-                ste_gate = hard_gate - soft_gate.detach() + soft_gate
+                ste_gate = (
+                    hard_gate - soft_gate.detach() + soft_gate
+                ).permute(0, 1, 3, 4, 2)
 
                 # Include only the first currently inactive level in rendering;
                 # its hard-forward opacity is zero but it carries STE gradients.
@@ -476,5 +501,22 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             predictions["conf"] = conf
 
         predictions["images"] = images
+
+        if render_sky:
+            if self.camera_head is None:
+                raise RuntimeError("Sky rendering requires camera pose predictions")
+            from dggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+            H, W = images.shape[-2:]
+            extrinsics, intrinsics = pose_encoding_to_extri_intri(
+                predictions["pose_enc"], (H, W)
+            )
+            extrinsic = extrinsics[0]
+            bottom = torch.zeros_like(extrinsic[:, :1, :])
+            bottom[..., 0, 3] = 1.0
+            extrinsic = torch.cat([extrinsic, bottom], dim=1)
+            predictions["sky_render"] = self.sky_model(
+                images, extrinsic, intrinsics[0]
+            )
 
         return predictions
