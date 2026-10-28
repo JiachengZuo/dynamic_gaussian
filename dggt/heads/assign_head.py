@@ -73,12 +73,7 @@ class VisibilityCountPredictor(nn.Module):
             vis_prob * self.count_values
         ).sum(dim=1, keepdim=True)
 
-        return {
-            "vis_feat": vis_feat,
-            "vis_logits": vis_logits,
-            "vis_prob": vis_prob,
-            "expected_vis_count": expected_vis_count,
-        }
+        return vis_feat, vis_logits,vis_prob,expected_vis_count
 
 
 class AssignHead(nn.Module):
@@ -228,6 +223,7 @@ class AssignHead(nn.Module):
         err_map = self._resize_like(err_map, fea_feat)
 
         # 保持融合输入 dtype 一致，兼容混合精度。
+        # torch.Size([2, 37, 518, 518])
         features = torch.cat(
             [
                 fea_feat,

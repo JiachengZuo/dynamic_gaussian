@@ -512,7 +512,7 @@ class GaussianHead(nn.Module):
                 x = x[:, frames_start_idx:frames_end_idx]
 
             x = x.view(B * S, -1, x.shape[-1])
-
+            
             x = self.norm(x)
 
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))

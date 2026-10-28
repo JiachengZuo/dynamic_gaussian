@@ -116,9 +116,9 @@ And download vggt pretrained model [here](https://huggingface.co/facebook/VGGT-1
 
 You can train the model on the Waymo Open dataset.
 ```bash
-torchrun --nproc_per_node=1 --master_port=0000 train.py \
-  --log_dir logs/xxx \
-  --ckpt_path /path/to/pretrained_checkpoint.pth 
+torchrun --nproc_per_node=1 --master_port=29500 train.py \
+  --log_dir logs \
+  --ckpt_path /home/djhuai/zuo_cvpr/dynamic/dynamic_gaussian/pretrained/model.pt
 ```
 
     --image_dir <path>: Path to the Waymo dataset directory containing processed training data (required).
